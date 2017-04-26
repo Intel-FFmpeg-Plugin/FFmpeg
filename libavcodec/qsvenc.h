@@ -131,6 +131,9 @@ typedef struct QSVEncContext {
     //for HEVC
     int has_vps;
 
+    //for H.264
+    int force_idr;
+
     char *load_plugins;
 } QSVEncContext;
 
