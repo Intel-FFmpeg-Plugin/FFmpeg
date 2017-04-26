@@ -687,8 +687,11 @@ int ff_qsv_encode(AVCodecContext *avctx, QSVEncContext *q,
             av_log(avctx, AV_LOG_ERROR, "Error submitting the frame for encoding.\n");
             return ret;
         }
-        if (frame->pict_type == AV_PICTURE_TYPE_I)
+        if (frame->pict_type == AV_PICTURE_TYPE_I) {
             ctrl.FrameType = MFX_FRAMETYPE_I | MFX_FRAMETYPE_REF;
+            if (q->force_idr)
+                ctrl.FrameType |= MFX_FRAMETYPE_IDR;
+        }
     }
 
     ret = av_new_packet(&new_pkt, q->packet_size);
