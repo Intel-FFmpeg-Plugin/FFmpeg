@@ -348,6 +348,7 @@ static void register_all(void)
     REGISTER_FILTER(WAVEFORM,       waveform,       vf);
     REGISTER_FILTER(WEAVE,          weave,          vf);
     REGISTER_FILTER(XBR,            xbr,            vf);
+    REGISTER_FILTER(XCAM,           xcam,           vf);
     REGISTER_FILTER(YADIF,          yadif,          vf);
     REGISTER_FILTER(ZMQ,            zmq,            vf);
     REGISTER_FILTER(ZOOMPAN,        zoompan,        vf);
