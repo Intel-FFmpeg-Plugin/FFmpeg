@@ -300,7 +300,9 @@ static QSVFrame *submit_frame(QSVVPPContext *s, AVFilterLink *inlink, AVFrame *p
         qsv_frame->surface = (mfxFrameSurface1 *)qsv_frame->frame->data[3];
     } else {
         /* make a copy if the input is not padded as libmfx requires */
-        if (picref->height & 31 || picref->linesize[0] & 31) {
+        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(picref->format);
+        if (picref->height & 31 || picref->linesize[0] & 31
+            || (!strcmp(desc->name, "yuv420p") && picref->linesize[0] & 63)) {
             qsv_frame->frame = ff_get_video_buffer(inlink,
                                                    FFALIGN(inlink->w, 32),
                                                    FFALIGN(inlink->h, 32));
