@@ -304,8 +304,8 @@ static QSVFrame *submit_frame(QSVVPPContext *s, AVFilterLink *inlink, AVFrame *p
         if (picref->height & 31 || picref->linesize[0] & 31
             || (!strcmp(desc->name, "yuv420p") && picref->linesize[0] & 63)) {
             qsv_frame->frame = ff_get_video_buffer(inlink,
-                                                   FFALIGN(inlink->w, 32),
-                                                   FFALIGN(inlink->h, 32));
+                                                   FFALIGN(inlink->w, 128),
+                                                   FFALIGN(inlink->h, 64));
             if (!qsv_frame->frame)
                 return NULL;
 
