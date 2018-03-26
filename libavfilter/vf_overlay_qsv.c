@@ -25,6 +25,7 @@
 #include "libavutil/common.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/eval.h"
+#include "libavutil/avstring.h"
 #include "libavutil/hwcontext.h"
 #include "libavutil/avstring.h"
 #include "libavutil/avassert.h"
@@ -39,56 +40,114 @@
 #include "framesync.h"
 #include "qsvvpp.h"
 
-#define MAIN    0
-#define OVERLAY 1
-
 #define OFFSET(x) offsetof(QSVOverlayContext, x)
 #define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
+#define MAKE_FUNC(name) \
+static double get_ ## name(void *opaque, double param1) \
+{ \
+    AVFilterContext *ctx = opaque; \
+    QSVOverlayContext *s = ctx->priv; \
+    int              idx = (int) param1; \
+    return (double)s->layouts[idx].name; \
+}
 
-enum var_name {
-    VAR_MAIN_iW,     VAR_MW,
-    VAR_MAIN_iH,     VAR_MH,
-    VAR_OVERLAY_iW,
-    VAR_OVERLAY_iH,
-    VAR_OVERLAY_X,  VAR_OX,
-    VAR_OVERLAY_Y,  VAR_OY,
-    VAR_OVERLAY_W,  VAR_OW,
-    VAR_OVERLAY_H,  VAR_OH,
-    VAR_VARS_NB
+enum LayoutPreset {
+    GRID,
+    MANUAL,
+    OVERLAY,
 };
+
+enum {
+    VAR_W,
+    VAR_H,
+    VAR_N,
+    VAR_n,
+    VAR_NUM,
+};
+
+enum {
+    ATTR_X,
+    ATTR_Y,
+    ATTR_W,
+    ATTR_H,
+    ATTR_A,
+    ATTR_NUM,
+};
+
+typedef struct QSVLayout {
+    int iw, ih;
+    int x, y, w, h, alpha;
+} QSVLayout;
 
 typedef struct QSVOverlayContext {
     const AVClass      *class;
 
     FFFrameSync fs;
     QSVVPPContext      *qsv;
+    QSVLayout *layouts;
+
+    /* AVExpressions */
+    double var_values[VAR_NUM];
+    AVExpr *(*iexpr)[ATTR_NUM];
+    AVExpr *ow_expr, *oh_expr;
+
+    /*
+     * User-defined values.
+     */
+    int nb_inputs;
+    enum LayoutPreset layout;
+    const char *out_w, *out_h;
+    const char *descs[ATTR_NUM];
+
     QSVVPPParam        qsv_param;
     mfxExtVPPComposite comp_conf;
-    double             var_values[VAR_VARS_NB];
-
-    char     *overlay_ox, *overlay_oy, *overlay_ow, *overlay_oh;
-    uint16_t  overlay_alpha, overlay_pixel_alpha;
-
 } QSVOverlayContext;
 
-static const char *const var_names[] = {
-    "main_w",     "W",   /* input width of the main layer */
-    "main_h",     "H",   /* input height of the main layer */
-    "overlay_iw",        /* input width of the overlay layer */
-    "overlay_ih",        /* input height of the overlay layer */
-    "overlay_x",  "x",   /* x position of the overlay layer inside of main */
-    "overlay_y",  "y",   /* y position of the overlay layer inside of main */
-    "overlay_w",  "w",   /* output width of overlay layer */
-    "overlay_h",  "h",   /* output height of overlay layer */
-    NULL
+MAKE_FUNC(iw)
+MAKE_FUNC(ih)
+
+MAKE_FUNC(x)
+MAKE_FUNC(y)
+MAKE_FUNC(w)
+MAKE_FUNC(h)
+MAKE_FUNC(alpha)
+
+static const char * const var_funcs[] = {
+    "iw", "ih",
+    "x", "y", "w", "h", "alpha",
+    NULL,
+};
+
+static double (* const func_list[]) (void *, double) = {
+    get_iw, get_ih,
+    get_x, get_y, get_w, get_h, get_alpha,
+    NULL,
+};
+
+static const char *var_names[] = {
+    "W", "H", "N", "n",
+    NULL,
 };
 
 static const AVOption overlay_qsv_options[] = {
-    { "x", "Overlay x position", OFFSET(overlay_ox), AV_OPT_TYPE_STRING, { .str="0"}, 0, 255, .flags = FLAGS},
-    { "y", "Overlay y position", OFFSET(overlay_oy), AV_OPT_TYPE_STRING, { .str="0"}, 0, 255, .flags = FLAGS},
-    { "w", "Overlay width",      OFFSET(overlay_ow), AV_OPT_TYPE_STRING, { .str="overlay_iw"}, 0, 255, .flags = FLAGS},
-    { "h", "Overlay height",     OFFSET(overlay_oh), AV_OPT_TYPE_STRING, { .str="overlay_ih*w/overlay_iw"}, 0, 255, .flags = FLAGS},
-    { "alpha", "Overlay global alpha", OFFSET(overlay_alpha), AV_OPT_TYPE_INT, { .i64 = 255}, 0, 255, .flags = FLAGS},
+    { "nb_inputs", "number of inputs", OFFSET(nb_inputs), AV_OPT_TYPE_INT, { .i64 = 2 }, 1, INT_MAX, FLAGS },
+
+    { "layout", "preset layout", OFFSET(layout),  AV_OPT_TYPE_INT, { .i64 = OVERLAY }, GRID, OVERLAY, FLAGS, "layout" },
+        { "grid",    NULL, 0, AV_OPT_TYPE_CONST, { .i64 = GRID },    .flags = FLAGS, "layout" },
+        { "manual",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MANUAL },  .flags = FLAGS, "layout" },
+        { "overlay", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = OVERLAY }, .flags = FLAGS, "layout" },
+
+    { "width",  "output width",  OFFSET(out_w), AV_OPT_TYPE_STRING, { .str = "-2" }, .flags = FLAGS },
+    { "w",      "output width",  OFFSET(out_w), AV_OPT_TYPE_STRING, { .str = "-2" }, .flags = FLAGS },
+    { "height", "output height", OFFSET(out_h), AV_OPT_TYPE_STRING, { .str = "-2" }, .flags = FLAGS },
+    { "h",      "output height", OFFSET(out_h), AV_OPT_TYPE_STRING, { .str = "-2" }, .flags = FLAGS },
+
+    { "x_expr", "each win's x position", OFFSET(descs[ATTR_X]), AV_OPT_TYPE_STRING, { .str = "0" },   .flags = FLAGS },
+    { "y_expr", "each win's y position", OFFSET(descs[ATTR_Y]), AV_OPT_TYPE_STRING, { .str = "0" },   .flags = FLAGS },
+    { "w_expr", "each win's width",      OFFSET(descs[ATTR_W]), AV_OPT_TYPE_STRING, { .str = "-2" },  .flags = FLAGS },
+    { "h_expr", "each win's height",     OFFSET(descs[ATTR_H]), AV_OPT_TYPE_STRING, { .str = "-2" },  .flags = FLAGS },
+    { "a_expr", "each win's alpha",      OFFSET(descs[ATTR_A]), AV_OPT_TYPE_STRING, { .str = "255" }, .flags = FLAGS },
+
     { "eof_action", "Action to take when encountering EOF from secondary input ",
         OFFSET(fs.opt_eof_action), AV_OPT_TYPE_INT, { .i64 = EOF_ACTION_REPEAT },
         EOF_ACTION_REPEAT, EOF_ACTION_PASS, .flags = FLAGS, "eof_action" },
@@ -102,62 +161,203 @@ static const AVOption overlay_qsv_options[] = {
 
 FRAMESYNC_DEFINE_CLASS(overlay_qsv, QSVOverlayContext, fs);
 
-static int eval_expr(AVFilterContext *ctx)
+static void free_layout(AVFilterContext *ctx)
 {
-    QSVOverlayContext *vpp = ctx->priv;
-    double     *var_values = vpp->var_values;
-    int                ret = 0;
-    AVExpr *ox_expr = NULL, *oy_expr = NULL;
-    AVExpr *ow_expr = NULL, *oh_expr = NULL;
+    QSVOverlayContext *s = ctx->priv;
+    int i, j;
 
-#define PASS_EXPR(e, s) {\
-    ret = av_expr_parse(&e, s, var_names, NULL, NULL, NULL, NULL, 0, ctx); \
-    if (ret < 0) {\
-        av_log(ctx, AV_LOG_ERROR, "Error when passing '%s'.\n", s);\
-        goto release;\
-    }\
+    if (s->ow_expr)    av_expr_free(s->ow_expr);
+    if (s->oh_expr)    av_expr_free(s->oh_expr);
+
+    if (s->iexpr) {
+        for (i = 0; i < ctx->nb_inputs; i++)
+            for (j = ATTR_X; j < ATTR_NUM; j++)
+                if (s->iexpr[i][j])
+                    av_expr_free(s->iexpr[i][j]);
+        av_freep(&s->iexpr);
+    }
+    av_freep(&s->layouts);
 }
-    PASS_EXPR(ox_expr, vpp->overlay_ox);
-    PASS_EXPR(oy_expr, vpp->overlay_oy);
-    PASS_EXPR(ow_expr, vpp->overlay_ow);
-    PASS_EXPR(oh_expr, vpp->overlay_oh);
-#undef PASS_EXPR
 
-    var_values[VAR_OVERLAY_W] =
-    var_values[VAR_OW]        = av_expr_eval(ow_expr, var_values, NULL);
-    var_values[VAR_OVERLAY_H] =
-    var_values[VAR_OH]        = av_expr_eval(oh_expr, var_values, NULL);
+static int setup_expr(AVFilterContext *ctx, const char *desc[][ATTR_NUM])
+{
+    QSVOverlayContext *s = ctx->priv;
+    int i, j;
 
-    /* calc again in case ow is relative to oh */
-    var_values[VAR_OVERLAY_W] =
-    var_values[VAR_OW]        = av_expr_eval(ow_expr, var_values, NULL);
+#define ALLOC_EXPR(expr, str, ctx) { \
+    int err = av_expr_parse(&(expr), str, var_names, var_funcs, func_list, NULL, NULL, 0, ctx); \
+    if (err < 0) \
+        return err; \
+}
 
-    var_values[VAR_OVERLAY_X] =
-    var_values[VAR_OX]        = av_expr_eval(ox_expr, var_values, NULL);
-    var_values[VAR_OVERLAY_Y] =
-    var_values[VAR_OY]        = av_expr_eval(oy_expr, var_values, NULL);
+    s->iexpr = av_mallocz_array(ctx->nb_inputs, sizeof(*s->iexpr));
+    if (!s->iexpr)
+        return AVERROR(ENOMEM);
 
-    /* calc again in case ox is relative to oy */
-    var_values[VAR_OVERLAY_X] =
-    var_values[VAR_OX]        = av_expr_eval(ox_expr, var_values, NULL);
+    ALLOC_EXPR(s->ow_expr, s->out_w, ctx);
+    ALLOC_EXPR(s->oh_expr, s->out_h, ctx);
 
-    /* calc overlay_w and overlay_h again incase relative to ox,oy */
-    var_values[VAR_OVERLAY_W] =
-    var_values[VAR_OW]        = av_expr_eval(ow_expr, var_values, NULL);
-    var_values[VAR_OVERLAY_H] =
-    var_values[VAR_OH]        = av_expr_eval(oh_expr, var_values, NULL);
-    var_values[VAR_OVERLAY_W] =
-    var_values[VAR_OW]        = av_expr_eval(ow_expr, var_values, NULL);
+    for (i = 0; i < ctx->nb_inputs; i++)
+        for (j = ATTR_X; j < ATTR_NUM; j++)
+            ALLOC_EXPR(s->iexpr[i][j], desc[i][j], ctx);
 
-release:
-    av_expr_free(ox_expr);
-    av_expr_free(oy_expr);
-    av_expr_free(ow_expr);
-    av_expr_free(oh_expr);
+    return 0;
+}
+
+static void eval_iexpr(AVFilterContext *ctx)
+{
+    QSVOverlayContext *s = ctx->priv;
+    int i, j, k;
+
+    for (k = ATTR_X; k < ATTR_NUM; k++) {
+        for (i = 0; i < ctx->nb_inputs; i++) {
+            QSVLayout *layout = s->layouts + i;
+            int *values[ATTR_NUM] = {
+                &layout->x, &layout->y, &layout->w, &layout->h, &layout->alpha
+            };
+
+            s->var_values[VAR_n] = i;
+            for (j = ATTR_X; j < ATTR_NUM; j++)
+                *values[j] = av_expr_eval(s->iexpr[i][j], s->var_values, ctx);
+        }
+    }
+}
+
+static void eval_oexpr(AVFilterContext *ctx)
+{
+    QSVOverlayContext *s = ctx->priv;
+
+    s->var_values[VAR_n] = 0;
+    s->var_values[VAR_W] = av_expr_eval(s->ow_expr, s->var_values, ctx);
+    s->var_values[VAR_H] = av_expr_eval(s->oh_expr, s->var_values, ctx);
+    s->var_values[VAR_W] = av_expr_eval(s->ow_expr, s->var_values, ctx);
+}
+
+static void eval_expr(AVFilterContext *ctx)
+{
+    QSVOverlayContext *s = ctx->priv;
+    int i;
+
+    for (i = 0; i < ctx->nb_inputs; i++) {
+        s->layouts[i].iw = ctx->inputs[i]->w;
+        s->layouts[i].ih = ctx->inputs[i]->h;
+    }
+
+    s->var_values[VAR_N] = ctx->nb_inputs;
+
+    eval_oexpr(ctx);
+    eval_iexpr(ctx);
+    eval_oexpr(ctx);
+
+    eval_factor(s->var_values[VAR_W], s->var_values[VAR_H], ctx->inputs[0]);
+
+    eval_iexpr(ctx);
+    for (i = 0; i < ctx->nb_inputs; i++)
+        eval_factor(s->layouts[i].w, s->layouts[i].h, ctx->inputs[i]);
+}
+
+static int setup_overlay(AVFilterContext *ctx)
+{
+    QSVOverlayContext *s = ctx->priv;
+    const char *exprs[][ATTR_NUM] = {
+        { "0", "0", "iw(0)", "ih(0)", "255" },
+        { s->descs[ATTR_X], s->descs[ATTR_Y], s->descs[ATTR_W], s->descs[ATTR_H], s->descs[ATTR_A] },
+    };
+
+    return setup_expr(ctx, exprs);
+}
+
+static int setup_grid(AVFilterContext *ctx)
+{
+    static const char *desc[ATTR_NUM] = {
+        "w(n)*mod(n,ceil(sqrt(N)))",
+        "h(n)*floor(n/ceil(sqrt(N)))",
+        "W/ceil(sqrt(N))",
+        "H/ceil(sqrt(N))",
+        "255"
+    };
+    const char *(*array)[ATTR_NUM] = av_mallocz_array(ctx->nb_inputs, sizeof(*array));
+    int i, ret;
+
+    if (!array) return AVERROR(ENOMEM);
+
+    for (i = 0; i < ctx->nb_inputs; i++)
+        memcpy(&array[i], &desc, sizeof(desc));
+
+    ret = setup_expr(ctx, array);
+    av_freep(&array);
 
     return ret;
 }
 
+static int setup_manual(AVFilterContext *ctx)
+{
+    QSVOverlayContext *s = ctx->priv;
+    const char *tmp, *(*sep_expr)[ATTR_NUM];
+    int i, j, ret = 0;
+
+    sep_expr = av_mallocz_array(ctx->nb_inputs, sizeof(*sep_expr));
+    if (!sep_expr)
+        return AVERROR(ENOMEM);
+
+    for (i = ATTR_X; i < ATTR_NUM; i++) {
+        if (!av_stristart(s->descs[i], "array", &tmp)) {
+            for (j = 0; j < ctx->nb_inputs; j++)
+                sep_expr[j][i] = av_strdup(s->descs[i]);
+        } else {
+            if (!tmp) {
+                ret = AVERROR(EINVAL);
+                goto failed;
+            }
+
+            tmp += strspn(tmp, "(");
+            for (j = 0; j < ctx->nb_inputs && *tmp; j++, tmp++) {
+                sep_expr[j][i] = av_get_token(&tmp, ",)");
+                if (!sep_expr[j][i]) {
+                    ret = AVERROR(ENOMEM);
+                    goto failed;
+                }
+            }
+
+            if (j < ctx->nb_inputs) {
+                av_log(ctx, AV_LOG_ERROR, "Not enough exprs (%d < %d) around %s.\n",
+                       j, i, s->descs[i]);
+                ret = AVERROR(EINVAL);
+                goto failed;
+            }
+        }
+    }
+
+    ret = setup_expr(ctx, sep_expr);
+
+failed:
+    for (i = 0; i < ctx->nb_inputs; i++)
+        for (j = ATTR_X; j < ATTR_NUM; j++)
+            av_freep(&sep_expr[i][j]);
+    av_freep(&sep_expr);
+
+    return ret;
+}
+
+static int setup_layout(AVFilterContext *ctx)
+{
+    QSVOverlayContext *s = ctx->priv;
+
+    s->layouts = av_mallocz_array(ctx->nb_inputs, sizeof(*s->layouts));
+    if (!s->layouts)
+        return AVERROR(ENOMEM);
+
+    switch (s->layout) {
+        case GRID:
+            return setup_grid(ctx);
+        case MANUAL:
+            return setup_manual(ctx);
+        case OVERLAY:
+            return setup_overlay(ctx);
+        default:
+            return AVERROR(EINVAL);
+    }
+}
 static int have_alpha_planar(AVFilterLink *link)
 {
     enum AVPixelFormat pix_fmt;
@@ -175,59 +375,6 @@ static int have_alpha_planar(AVFilterLink *link)
 
     return !!(desc->flags & AV_PIX_FMT_FLAG_ALPHA);
 }
-
-static int config_main_input(AVFilterLink *inlink)
-{
-    AVFilterContext      *ctx = inlink->dst;
-    QSVOverlayContext    *vpp = ctx->priv;
-    mfxVPPCompInputStream *st = &vpp->comp_conf.InputStream[0];
-
-    av_log(ctx, AV_LOG_DEBUG, "Input[%d] is of %s.\n", FF_INLINK_IDX(inlink),
-           av_get_pix_fmt_name(inlink->format));
-
-    vpp->var_values[VAR_MAIN_iW] =
-    vpp->var_values[VAR_MW]      = inlink->w;
-    vpp->var_values[VAR_MAIN_iH] =
-    vpp->var_values[VAR_MH]      = inlink->h;
-
-    st->DstX              = 0;
-    st->DstY              = 0;
-    st->DstW              = inlink->w;
-    st->DstH              = inlink->h;
-    st->GlobalAlphaEnable = 0;
-    st->PixelAlphaEnable  = 0;
-
-    return 0;
-}
-
-static int config_overlay_input(AVFilterLink *inlink)
-{
-    AVFilterContext       *ctx = inlink->dst;
-    QSVOverlayContext     *vpp = ctx->priv;
-    mfxVPPCompInputStream *st  = &vpp->comp_conf.InputStream[1];
-    int                    ret = 0;
-
-    av_log(ctx, AV_LOG_DEBUG, "Input[%d] is of %s.\n", FF_INLINK_IDX(inlink),
-           av_get_pix_fmt_name(inlink->format));
-
-    vpp->var_values[VAR_OVERLAY_iW] = inlink->w;
-    vpp->var_values[VAR_OVERLAY_iH] = inlink->h;
-
-    ret = eval_expr(ctx);
-    if (ret < 0)
-        return ret;
-
-    st->DstX              = vpp->var_values[VAR_OX];
-    st->DstY              = vpp->var_values[VAR_OY];
-    st->DstW              = vpp->var_values[VAR_OW];
-    st->DstH              = vpp->var_values[VAR_OH];
-    st->GlobalAlpha       = vpp->overlay_alpha;
-    st->GlobalAlphaEnable = (st->GlobalAlpha < 255);
-    st->PixelAlphaEnable  = have_alpha_planar(inlink);
-
-    return 0;
-}
-
 static int process_frame(FFFrameSync *fs)
 {
     AVFilterContext  *ctx = fs->parent;
@@ -268,47 +415,11 @@ static int init_framesync(AVFilterContext *ctx)
     return ff_framesync_configure(&s->fs);
 }
 
-static int config_output(AVFilterLink *outlink)
-{
-    AVFilterContext   *ctx = outlink->src;
-    QSVOverlayContext *vpp = ctx->priv;
-    AVFilterLink      *in0 = ctx->inputs[0];
-    AVFilterLink      *in1 = ctx->inputs[1];
-    int ret;
-
-    av_log(ctx, AV_LOG_DEBUG, "Output is of %s.\n", av_get_pix_fmt_name(outlink->format));
-    if ((in0->format == AV_PIX_FMT_QSV && in1->format != AV_PIX_FMT_QSV) ||
-        (in0->format != AV_PIX_FMT_QSV && in1->format == AV_PIX_FMT_QSV)) {
-        av_log(ctx, AV_LOG_ERROR, "Mixing hardware and software pixel formats is not supported.\n");
-        return AVERROR(EINVAL);
-    } else if (in0->format == AV_PIX_FMT_QSV) {
-        AVHWFramesContext *hw_frame0 = (AVHWFramesContext *)in0->hw_frames_ctx->data;
-        AVHWFramesContext *hw_frame1 = (AVHWFramesContext *)in1->hw_frames_ctx->data;
-
-        if (hw_frame0->device_ctx != hw_frame1->device_ctx) {
-            av_log(ctx, AV_LOG_ERROR, "Inputs with different underlying QSV devices are forbidden.\n");
-            return AVERROR(EINVAL);
-        }
-    }
-
-    outlink->w          = vpp->var_values[VAR_MW];
-    outlink->h          = vpp->var_values[VAR_MH];
-    outlink->frame_rate = in0->frame_rate;
-    outlink->time_base  = av_inv_q(outlink->frame_rate);
-
-    ret = init_framesync(ctx);
-    if (ret < 0)
-        return ret;
-
-    return ff_qsvvpp_create(ctx, &vpp->qsv, &vpp->qsv_param);
-}
-
 /*
  * Callback for qsvvpp
  * @Note: qsvvpp composition does not generate PTS for result frame.
  *        so we assign the PTS from framesync to the output frame.
  */
-
 static int filter_callback(AVFilterLink *outlink, AVFrame *frame)
 {
     QSVOverlayContext *s = outlink->src->priv;
@@ -317,42 +428,117 @@ static int filter_callback(AVFilterLink *outlink, AVFrame *frame)
     return ff_filter_frame(outlink, frame);
 }
 
-
-static int overlay_qsv_init(AVFilterContext *ctx)
+static int init_qsvvpp(AVFilterContext *ctx)
 {
-    QSVOverlayContext *vpp = ctx->priv;
+    QSVOverlayContext    *s = ctx->priv;
+    AVFilterLink   *outlink = ctx->outputs[0];
+    int i, ret;
 
     /* fill composite config */
-    vpp->comp_conf.Header.BufferId = MFX_EXTBUFF_VPP_COMPOSITE;
-    vpp->comp_conf.Header.BufferSz = sizeof(vpp->comp_conf);
-    vpp->comp_conf.NumInputStream  = ctx->nb_inputs;
-    vpp->comp_conf.InputStream     = av_mallocz_array(ctx->nb_inputs,
-                                                      sizeof(*vpp->comp_conf.InputStream));
-    if (!vpp->comp_conf.InputStream)
+    s->comp_conf.Header.BufferId = MFX_EXTBUFF_VPP_COMPOSITE;
+    s->comp_conf.Header.BufferSz = sizeof(s->comp_conf);
+    s->comp_conf.NumInputStream  = ctx->nb_inputs;
+    s->comp_conf.InputStream     = av_mallocz_array(ctx->nb_inputs,
+                                                      sizeof(*s->comp_conf.InputStream));
+    if (!s->comp_conf.InputStream)
         return AVERROR(ENOMEM);
 
     /* initialize QSVVPP params */
-    vpp->qsv_param.filter_frame = filter_callback;
-    vpp->qsv_param.ext_buf      = av_mallocz(sizeof(*vpp->qsv_param.ext_buf));
-    if (!vpp->qsv_param.ext_buf)
+    s->qsv_param.filter_frame = filter_callback;
+    s->qsv_param.ext_buf      = av_mallocz(sizeof(*s->qsv_param.ext_buf));
+    if (!s->qsv_param.ext_buf)
         return AVERROR(ENOMEM);
 
-    vpp->qsv_param.ext_buf[0]    = (mfxExtBuffer *)&vpp->comp_conf;
-    vpp->qsv_param.num_ext_buf   = 1;
-    vpp->qsv_param.out_sw_format = AV_PIX_FMT_NV12;
-    vpp->qsv_param.num_crop      = 0;
+    s->qsv_param.ext_buf[0]    = (mfxExtBuffer *)&s->comp_conf;
+    s->qsv_param.num_ext_buf   = 1;
+    s->qsv_param.out_sw_format = AV_PIX_FMT_NV12;
+    s->qsv_param.num_crop      = 0;
 
-    return 0;
+    for (i = 0; i < ctx->nb_inputs; i++) {
+        mfxVPPCompInputStream *st = &s->comp_conf.InputStream[i];
+        AVFilterLink      *inlink = ctx->inputs[i];
+        QSVLayout         *layout = &s->layouts[i];
+
+        st->DstX              = av_clip(layout->x, 0, outlink->w);
+        st->DstY              = av_clip(layout->y, 0, outlink->h);
+        st->DstW              = layout->w;
+        st->DstH              = layout->h;
+        st->GlobalAlpha       = layout->alpha;
+        st->GlobalAlphaEnable = (st->GlobalAlpha < 255);
+        st->PixelAlphaEnable  = have_alpha_planar(inlink);
+        av_log(ctx, AV_LOG_VERBOSE, "Input[%d] is of %s, rect[%d,%d,%d,%d].\n",
+               i, av_get_pix_fmt_name(inlink->format), st->DstX, st->DstY, st->DstW, st->DstH);
+    }
+
+    ret = ff_qsvvpp_create(ctx, &s->qsv, &s->qsv_param);
+
+    av_freep(&s->qsv_param.ext_buf);
+    av_freep(&s->comp_conf.InputStream);
+    return ret;
+}
+
+
+static int config_output(AVFilterLink *outlink)
+{
+    AVFilterContext   *ctx = outlink->src;
+    QSVOverlayContext *vpp = ctx->priv;
+    AVFilterLink      *in0 = ctx->inputs[0];
+    int ret;
+
+    eval_expr(ctx);
+    outlink->w          = vpp->var_values[VAR_W];
+    outlink->h          = vpp->var_values[VAR_H];
+    outlink->frame_rate = in0->frame_rate;
+    outlink->time_base  = av_inv_q(outlink->frame_rate);
+
+    ret = init_framesync(ctx);
+    if (ret < 0)
+        return ret;
+    return init_qsvvpp(ctx);
 }
 
 static void overlay_qsv_uninit(AVFilterContext *ctx)
 {
     QSVOverlayContext *vpp = ctx->priv;
+    int i;
 
+    free_layout(ctx);
     ff_qsvvpp_free(&vpp->qsv);
     ff_framesync_uninit(&vpp->fs);
-    av_freep(&vpp->comp_conf.InputStream);
-    av_freep(&vpp->qsv_param.ext_buf);
+    for (i = 0; i < ctx->nb_inputs; i++)
+        av_freep(&ctx->input_pads[i].name);
+}
+
+static int overlay_qsv_init(AVFilterContext *ctx)
+{
+    QSVOverlayContext *s = ctx->priv;
+    AVFilterPad inpad;
+    int ret, idx;
+
+    /* Force nb_inputs to 2 in overlay mode */
+    if (s->layout == OVERLAY)
+        s->nb_inputs = 2;
+
+    for (idx = 0; idx < s->nb_inputs; idx++) {
+        memset(&inpad, 0, sizeof(inpad));
+        inpad.name         = NULL;
+        inpad.type         = AVMEDIA_TYPE_VIDEO;
+        ret = ff_insert_inpad(ctx, idx, &inpad);
+        if (ret < 0)
+            goto failed;
+    }
+
+    ret = setup_layout(ctx);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "setup layout failed.\n");
+        goto failed;
+    }
+
+failed:
+    if (ret < 0)
+        overlay_qsv_uninit(ctx);
+
+    return ret;
 }
 
 static int activate(AVFilterContext *ctx)
@@ -393,20 +579,6 @@ static int overlay_qsv_query_formats(AVFilterContext *ctx)
     return 0;
 }
 
-static const AVFilterPad overlay_qsv_inputs[] = {
-    {
-        .name          = "main",
-        .type          = AVMEDIA_TYPE_VIDEO,
-        .config_props  = config_main_input,
-    },
-    {
-        .name          = "overlay",
-        .type          = AVMEDIA_TYPE_VIDEO,
-        .config_props  = config_overlay_input,
-    },
-    { NULL }
-};
-
 static const AVFilterPad overlay_qsv_outputs[] = {
     {
         .name          = "default",
@@ -425,8 +597,8 @@ AVFilter ff_vf_overlay_qsv = {
     .init           = overlay_qsv_init,
     .uninit         = overlay_qsv_uninit,
     .activate       = activate,
-    .inputs         = overlay_qsv_inputs,
     .outputs        = overlay_qsv_outputs,
     .priv_class     = &overlay_qsv_class,
+    .flags          = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
