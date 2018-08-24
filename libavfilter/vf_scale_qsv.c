@@ -546,7 +546,7 @@ static int qsvscale_filter_frame(AVFilterLink *link, AVFrame *in)
     mfxFrameSurface1 in_surf = *(mfxFrameSurface1*)in->data[3];
     do {
         err = MFXVideoVPP_RunFrameVPPAsync(s->session,
-                                           (mfxFrameSurface1*)in->data[3],
+                                           &in_surf,
                                            (mfxFrameSurface1*)out->data[3],
                                            NULL, &sync);
         if (err == MFX_WRN_DEVICE_BUSY)
