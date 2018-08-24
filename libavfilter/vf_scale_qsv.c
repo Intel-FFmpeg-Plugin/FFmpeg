@@ -543,6 +543,7 @@ static int qsvscale_filter_frame(AVFilterLink *link, AVFrame *in)
         goto fail;
     }
 
+    mfxFrameSurface1 in_surf = *(mfxFrameSurface1*)in->data[3];
     do {
         err = MFXVideoVPP_RunFrameVPPAsync(s->session,
                                            (mfxFrameSurface1*)in->data[3],
